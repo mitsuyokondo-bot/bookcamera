@@ -4,15 +4,11 @@
   <meta charset="UTF-8" />
   <title>バーコード蔵書管理アプリ</title>
   
-  <!-- Tailwind CSS（Play CDN） -->
+  <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- QuaggaJS（CDNJS） + SRI -->
-  <script
-    src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.js"
-    integrity="sha512-bCsBoYoW6zE0aja5xcIyoCDPfT27+cGr7AOCqelttLVRGay6EKGQbR6wm6SUcUGOMGXJpj+jrIpMS6i80+kZPw=="
-    crossorigin="anonymous">
-  </script>
+  <!-- QuaggaJS -->
+  <script src="https://unpkg.com/quagga@0.12.1/dist/quagga.min.js"></script>
 
   <!-- カメラ映像の表示崩れを直すCSS -->
   <style>
@@ -39,7 +35,7 @@
       <div>
         <h1 class="text-2xl font-bold text-slate-900">バーコード蔵書管理アプリ</h1>
         <p class="text-sm text-slate-600 mt-1">
-          カメラで本のバーコード（ISBN）を読み取り、タイトル・著者・出版社・出版日を一覧管理します。
+          カメラで本のバーコード（ISBN）を読み取り、タイトル・著者・出版社・出版日・ISBNを一覧管理します。
         </p>
       </div>
       <div class="text-xs text-slate-500">※カメラ利用のため、HTTPS または localhost を推奨</div>
@@ -47,7 +43,7 @@
 
     <div class="grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(0,2fr)]">
       
-      <!-- Camera Section -->
+      <!-- Camera Area -->
       <section class="bg-white rounded-2xl shadow-sm p-4 flex flex-col gap-4">
         <h2 class="text-lg font-semibold text-slate-800 mb-1">カメラ & バーコード読み取り</h2>
 
@@ -69,8 +65,8 @@
 
         <div class="mt-2 text-xs text-slate-500 leading-relaxed">
           ・ISBNバーコード（13桁・先頭978/979）を読み取ります。<br>
-          ・Google Books API を利用して書籍情報を取得します。<br>
-          ・同じ本を連続で読み取らないように制御しています。
+          ・同じコードの連続読み取りは一定時間スキップします。<br>
+          ・Google Books API を利用して書籍情報を取得します。
         </div>
 
         <div id="status" class="mt-2 text-xs text-slate-500">
@@ -78,13 +74,13 @@
         </div>
       </section>
 
-      <!-- Book List Section -->
+      <!-- Book List -->
       <section class="bg-white rounded-2xl shadow-sm p-4 flex flex-col">
         <div class="flex items-center justify-between mb-3 gap-3">
           <div>
             <h2 class="text-lg font-semibold text-slate-800">読み取り済み書籍リスト</h2>
             <p class="text-xs text-slate-500">
-              最新の登録が一番上に表示されます。
+              最新の登録が一番上に表示されます。ISBNが同じ本は1件のみ登録されます。
             </p>
           </div>
           <div class="flex items-center gap-2">
@@ -116,19 +112,34 @@
     let books = [];
     let scannerActive = false;
     let lastScan = { code: null, time: 0 };
+    // ★ 同じISBNを並行処理しないためのセット
+    let processingIsbns = new Set();
 
     const statusTextEl = document.getElementById('status-text');
     const bookListEl = document.getElementById('book-list');
     const emptyMessageEl = document.getElementById('empty-message');
 
-    /*------------------------------------------------
-      localStorage 読み込み・保存
-    ------------------------------------------------*/
     function loadFromStorage() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) books = JSON.parse(raw) || [];
-      } catch {}
+        if (raw) {
+          books = JSON.parse(raw);
+
+          // 古いデータとの互換用：欠けているフィールドを補完
+          if (Array.isArray(books)) {
+            books = books.map(b => ({
+              isbn: b.isbn,
+              title: b.title ?? 'タイトル不明',
+              authors: b.authors ?? '不明',
+              publisher: b.publisher ?? '不明',
+              publishedDate: b.publishedDate ?? '不明',
+              addedAt: b.addedAt ?? new Date().toISOString()
+            }));
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
       renderBookList();
     }
 
@@ -149,9 +160,6 @@
         .replace(/'/g, '&#039;');
     }
 
-    /*------------------------------------------------
-      書籍リスト描画
-    ------------------------------------------------*/
     function renderBookList() {
       if (!books.length) {
         emptyMessageEl.classList.remove('hidden');
@@ -162,36 +170,47 @@
       emptyMessageEl.classList.add('hidden');
       bookListEl.classList.remove('hidden');
 
-      bookListEl.innerHTML = books.map((book, index) => `
-        <li class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
-          <div class="flex justify-between">
-            <div>
-              <p class="font-semibold text-slate-900">${escapeHtml(book.title)}</p>
-              <p class="text-xs text-slate-600">著者: ${escapeHtml(book.authors)}</p>
-              <p class="text-xs text-slate-600">出版社: ${escapeHtml(book.publisher)}</p>
-              <p class="text-xs text-slate-600">出版日: ${escapeHtml(book.publishedDate)}</p>
-              <p class="text-xs text-slate-500">ISBN: <span class="font-mono">${escapeHtml(book.isbn)}</span></p>
+      bookListEl.innerHTML = books.map((book, index) => {
+        const dateLabel = new Date(book.addedAt).toLocaleString('ja-JP', {
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit'
+        });
+
+        return `
+          <li class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 flex gap-3 items-start">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="font-semibold text-slate-900 truncate">${escapeHtml(book.title)}</p>
+                  <p class="text-xs text-slate-600 mt-0.5">
+                    著者: <span class="font-medium">${escapeHtml(book.authors)}</span>
+                  </p>
+                </div>
+                <button class="shrink-0 px-2 py-1 rounded-full text-[11px] font-medium bg-rose-50 text-rose-600 hover:bg-rose-100 delete-btn"
+                        data-index="${index}">削除</button>
+              </div>
+              <div class="mt-1 text-[11px] text-slate-500 space-y-0.5">
+                <div>出版社: <span class="font-medium">${escapeHtml(book.publisher)}</span></div>
+                <div>出版日: <span class="font-medium">${escapeHtml(book.publishedDate)}</span></div>
+                <div>ISBN: <span class="font-mono">${escapeHtml(book.isbn)}</span></div>
+                <div>登録日時: ${escapeHtml(dateLabel)}</div>
+              </div>
             </div>
-            <button
-              class="px-2 py-1 rounded-full text-[11px] font-medium bg-rose-50 text-rose-600 hover:bg-rose-100 delete-btn"
-              data-index="${index}">削除</button>
-          </div>
-        </li>
-      `).join('');
+          </li>`;
+      }).join('');
     }
 
-    /*------------------------------------------------
-      書籍削除
-    ------------------------------------------------*/
+    // 書籍削除
     bookListEl.addEventListener('click', (e) => {
       const btn = e.target.closest('.delete-btn');
       if (!btn) return;
-      const idx = Number(btn.dataset.index);
+      const idx = parseInt(btn.dataset.index, 10);
       books.splice(idx, 1);
       saveToStorage();
       renderBookList();
     });
 
+    // 全削除
     document.getElementById('clear-all-btn').addEventListener('click', () => {
       if (!books.length) return;
       if (confirm("すべて削除しますか？")) {
@@ -201,19 +220,21 @@
       }
     });
 
-    /*------------------------------------------------
-      CSV出力
-    ------------------------------------------------*/
+    // CSV出力
     document.getElementById('export-csv-btn').addEventListener('click', () => {
       if (!books.length) {
-        alert("データがありません");
+        alert('書籍データがありません。');
         return;
       }
 
-      const toCell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const toCell = (value) => {
+        const s = String(value ?? '');
+        return '"' + s.replace(/"/g, '""') + '"';
+      };
 
       const header = ['ISBN', 'タイトル', '著者', '出版社', '出版日', '登録日時'];
-      const lines = [header.map(toCell).join(",")];
+      const lines = [];
+      lines.push(header.map(toCell).join(','));
 
       books.forEach(b => {
         lines.push([
@@ -223,42 +244,45 @@
           toCell(b.publisher),
           toCell(b.publishedDate),
           toCell(b.addedAt)
-        ].join(","));
+        ].join(','));
       });
 
-      const csv = "\uFEFF" + lines.join("\r\n");
-      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
+      const csvBody = lines.join('\r\n');
+      const bom = '\uFEFF';
+      const blob = new Blob([bom + csvBody], { type: 'text/csv;charset=utf-8;' });
 
-      const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
       a.href = url;
-      a.download = "books.csv";
+      a.download = 'books.csv';
       a.click();
       URL.revokeObjectURL(url);
     });
 
-    /*------------------------------------------------
-      Quagga (Barcode Scan)
-    ------------------------------------------------*/
+    // ===== Quagga（バーコード読み取り） =====
     function startScanner() {
       if (scannerActive) return;
 
-      setStatus("カメラ起動中…");
+      setStatus('カメラ起動中…');
 
       Quagga.init({
         inputStream: {
           name: 'Live',
           type: 'LiveStream',
           target: document.querySelector('#video-container'),
-          constraints: { facingMode: 'environment' }
+          constraints: {
+            facingMode: 'environment',
+            width: 640,
+            height: 480
+          }
         },
         decoder: { readers: ['ean_reader'] },
         locate: true
       }, (err) => {
         if (err) {
-          setStatus("エラー");
           alert("カメラ起動に失敗しました");
           console.error(err);
+          setStatus("エラー");
           return;
         }
         Quagga.start();
@@ -276,57 +300,83 @@
       setStatus("停止中");
     }
 
+    // ★ 同じ本を何件も登録しないように制御
     async function onDetected(result) {
+      if (!scannerActive) return;
+
       const code = result?.codeResult?.code;
       if (!code) return;
 
       const now = Date.now();
       if (lastScan.code === code && now - lastScan.time < 3000) return;
-
       lastScan = { code, time: now };
 
-      // ISBN-13形式チェック
+      // ISBN-13形式（978/979で始まる13桁）のみ対象
       if (!/^\d{13}$/.test(code) || (!code.startsWith('978') && !code.startsWith('979'))) {
         return;
       }
 
-      // 重複チェック
+      // すでに登録済みのISBNはスキップ
       if (books.some(b => b.isbn === code)) {
         setStatus(`すでに登録済み: ${code}`);
         return;
       }
 
+      // 同じISBNを並行して処理しないよう制御
+      if (processingIsbns.has(code)) {
+        setStatus(`ISBN ${code} を処理中です…`);
+        return;
+      }
+      processingIsbns.add(code);
+
       setStatus(`ISBN ${code} の情報取得中…`);
 
       try {
-        const info = await fetchBookInfo(code);
-        books.unshift(info);
-        saveToStorage();
-        renderBookList();
-        setStatus("登録完了");
+        const book = await fetchBookInfo(code);
+
+        // ネットワーク遅延などで二重登録を防ぐため再チェック
+        if (!books.some(b => b.isbn === code)) {
+          books.unshift(book);
+          saveToStorage();
+          renderBookList();
+          setStatus(`登録完了: ${book.title}`);
+        } else {
+          setStatus(`すでに登録済み: ${code}`);
+        }
       } catch (e) {
         console.error(e);
         setStatus("情報取得失敗");
         alert("書籍情報の取得に失敗しました");
+      } finally {
+        processingIsbns.delete(code);
       }
     }
 
-    /*------------------------------------------------
-      Google Books API (出版社 / 出版日 含む)
-    ------------------------------------------------*/
+    // Google Books API から出版社・出版日も取得
     async function fetchBookInfo(isbn) {
       const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`;
       const res = await fetch(url);
       const data = await res.json();
 
-      const info = data.items?.[0]?.volumeInfo ?? {};
+      let title = "タイトル不明";
+      let authors = "不明";
+      let publisher = "不明";
+      let publishedDate = "不明";
+
+      if (data.totalItems > 0 && data.items[0].volumeInfo) {
+        const info = data.items[0].volumeInfo;
+        title = info.title || title;
+        if (info.authors) authors = info.authors.join(", ");
+        if (info.publisher) publisher = info.publisher;
+        if (info.publishedDate) publishedDate = info.publishedDate;
+      }
 
       return {
         isbn,
-        title: info.title ?? "タイトル不明",
-        authors: info.authors?.join(", ") ?? "不明",
-        publisher: info.publisher ?? "不明",
-        publishedDate: info.publishedDate ?? "不明",
+        title,
+        authors,
+        publisher,
+        publishedDate,
         addedAt: new Date().toISOString()
       };
     }
